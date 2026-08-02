@@ -34,6 +34,10 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Uploaded files (keep the folder, ignore its contents)
+backend/uploads/*
+!backend/uploads/.gitkeep
+
 # Logs
 *.log
 logs/
