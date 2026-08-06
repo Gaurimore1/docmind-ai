@@ -9,6 +9,9 @@ from app.services.file_service import save_upload_file
 # Import the extraction function from the service layer.
 # The router calls it by name — it has no knowledge of PyMuPDF internals.
 from app.services.pdf_service import extract_text_from_pdf
+# Import the chunking function from the service layer.
+# The router calls it to split extracted text into fixed-size overlapping pieces.
+from app.services.chunk_service import chunk_text
 
 # APIRouter isolates these routes from main.py.
 # 'tags' groups this endpoint under "Upload" in the Swagger UI at /docs.
@@ -23,8 +26,8 @@ async def upload_pdf(
 ):
     """
     Accept a PDF file, save it to the uploads/ directory,
-    extract its text, and return upload status, filename,
-    total pages, and a 500-character text preview.
+    extract its text, chunk it, and return upload status, filename,
+    total pages, chunk count, and a 500-character text preview.
     """
 
     # Reject anything that isn't a PDF before reading any bytes.
@@ -57,10 +60,20 @@ async def upload_pdf(
     # [:500] slices the first 500 characters for the preview.
     text_preview = extraction["text"].strip()[:500]
 
-    # Return a clean JSON response with exactly the four fields requested.
+    # Pass the full extracted text to chunk_text().
+    # chunk_text() uses chunk_size=1000 and overlap=200 by default.
+    # It returns a list[str] — one entry per chunk.
+    chunks = chunk_text(extraction["text"])
+
+    # len(chunks) gives the total number of chunks produced.
+    # This is what goes into the "chunks" key of the response.
+    chunk_count = len(chunks)
+
+    # Return a clean JSON response with all five requested fields.
     return {
         "status": "success",
         "filename": file.filename,
         "pages": extraction["pages"],
+        "chunks": chunk_count,
         "text_preview": text_preview,
     }
