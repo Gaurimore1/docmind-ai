@@ -34,7 +34,7 @@ export default function UploadButton({ onUploadSuccess }) {
             })
         } catch (err) {
             if (err.message.includes('fetch') || err.message.includes('Failed to fetch')) {
-                setError('Unable to connect to DocMind AI. Please make sure the backend is running.')
+                setError('Unable to connect to the backend.')
             } else {
                 setError(err.message)
             }
@@ -45,7 +45,7 @@ export default function UploadButton({ onUploadSuccess }) {
     }
 
     return (
-        <div className="upload-area">
+        <div>
             <input
                 ref={inputRef}
                 type="file"
@@ -67,11 +67,13 @@ export default function UploadButton({ onUploadSuccess }) {
                     </>
                 ) : (
                     <>
-                        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true" className="upload-icon">
-                            <path d="M8 2v8M5 5l3-3 3 3" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                            <path d="M2 11v1a2 2 0 002 2h8a2 2 0 002-2v-1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                        <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path d="M8 2v8M5 5l3-3 3 3" stroke="currentColor" strokeWidth="1.5"
+                                strokeLinecap="round" strokeLinejoin="round" />
+                            <path d="M2 11v1a2 2 0 002 2h8a2 2 0 002-2v-1" stroke="currentColor"
+                                strokeWidth="1.5" strokeLinecap="round" />
                         </svg>
-                        Upload PDF
+                        Upload document
                     </>
                 )}
             </button>

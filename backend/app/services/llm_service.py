@@ -19,8 +19,9 @@
 
 
 import logging
+import os
 
-from ollama import chat
+from ollama import Client
 
 
 # Module-level logger.
@@ -30,6 +31,16 @@ logger = logging.getLogger(__name__)
 # Ollama model used by DocMind AI.
 # phi3:mini is small and fast enough for local development.
 MODEL_NAME = "phi3:mini"
+
+# Ollama host — reads from the OLLAMA_URL environment variable so the
+# Docker container can point to the Windows host via host.docker.internal.
+# Falls back to localhost for direct (non-Docker) development.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+
+# Module-level client instance — created once at startup.
+# Passing host= explicitly overrides Ollama's default localhost assumption,
+# which is why the previous top-level chat() call failed inside Docker.
+client = Client(host=OLLAMA_URL)
 
 
 def generate_answer(
@@ -125,7 +136,7 @@ provided documents."
 """
 
     try:
-        response = chat(
+        response = client.chat(
             model=MODEL_NAME,
             messages=[
                 {

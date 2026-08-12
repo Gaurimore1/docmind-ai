@@ -8,7 +8,7 @@
 #
 # It also provides get_db(), a FastAPI dependency that opens a session,
 # yields it to the route handler, and always closes it when the request ends.
-
+import os
 from typing import Generator
 
 # create_engine builds the connection pool.
@@ -26,7 +26,10 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # In production this value should be read from an environment variable
 # (e.g. os.getenv("DATABASE_URL")) so credentials are never hardcoded.
 # It is hardcoded here for the current development phase as instructed.
-DATABASE_URL = "postgresql://docmind:docmind123@localhost:5432/docmind"
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://docmind:docmind123@localhost:5432/docmind",
+)
 
 # ---------------------------------------------------------------------------
 # Engine
