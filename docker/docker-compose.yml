@@ -25,6 +25,9 @@ services:
 
   backend:
     image: docmind-backend:latest
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
     container_name: docmind-backend
     restart: unless-stopped
 

@@ -50,3 +50,6 @@ coverage/
 
 # Docker
 *.override.yml
+docker/login.json
+.env
+.env.*

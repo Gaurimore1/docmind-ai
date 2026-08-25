@@ -1,64 +1,281 @@
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
+const API_BASE =
+    import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8000'
 
-/**
- * Check whether the backend is reachable.
- * Returns true if reachable, false otherwise.
- */
+const TOKEN_KEY = 'docmind_access_token'
+
+
+// ============================================================
+// TOKEN MANAGEMENT
+// ============================================================
+
+export function getToken() {
+    return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setToken(token) {
+    localStorage.setItem(TOKEN_KEY, token)
+}
+
+export function clearToken() {
+    localStorage.removeItem(TOKEN_KEY)
+}
+
+
+// ============================================================
+// AUTHENTICATED FETCH
+// ============================================================
+
+async function authenticatedFetch(url, options = {}) {
+    const token = getToken()
+
+    const headers = {
+        ...(options.headers || {}),
+    }
+
+    if (token) {
+        headers.Authorization = `Bearer ${token}`
+    }
+
+    const response = await fetch(url, {
+        ...options,
+        headers,
+    })
+
+    // JWT expired / invalid
+    if (response.status === 401) {
+        clearToken()
+
+        window.dispatchEvent(
+            new CustomEvent('docmind-auth-expired')
+        )
+    }
+
+    return response
+}
+
+
+// ============================================================
+// HEALTH CHECK
+// ============================================================
+
 export async function checkHealth() {
     try {
-        const res = await fetch(`${API_BASE}/`, { signal: AbortSignal.timeout(3000) })
+        const res = await fetch(
+            `${API_BASE}/`,
+            {
+                signal: AbortSignal.timeout(3000),
+            }
+        )
+
         return res.ok
     } catch {
         return false
     }
 }
 
-/**
- * Upload a PDF file to the backend.
- * @param {File} file
- * @returns {Promise<object>} Backend response JSON
- */
-export async function uploadDocument(file) {
-    const formData = new FormData()
-    formData.append('file', file)
 
-    const res = await fetch(`${API_BASE}/api/v1/upload`, {
-        method: 'POST',
-        body: formData,
-    })
+// ============================================================
+// SIGNUP
+// ============================================================
+
+export async function signupUser(name, email, password) {
+    const res = await fetch(
+        `${API_BASE}/api/v1/auth/signup`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                name,
+                email,
+                password,
+            }),
+        }
+    )
 
     const data = await res.json()
 
     if (!res.ok) {
-        const detail = data?.detail || `Upload failed (${res.status})`
+        const detail =
+            data?.detail ||
+            `Signup failed (${res.status})`
+
+        if (Array.isArray(detail)) {
+            throw new Error(
+                detail
+                    .map((item) => item.msg)
+                    .join(', ')
+            )
+        }
+
         throw new Error(detail)
     }
 
     return data
 }
 
-/**
- * Search documents with a natural-language question.
- * @param {string} question
- * @returns {Promise<object>} { answer, sources, results }
- */
-export async function searchDocuments(question) {
-    const res = await fetch(`${API_BASE}/api/v1/search`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
-    })
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+export async function loginUser(email, password) {
+    const res = await fetch(
+        `${API_BASE}/api/v1/auth/login`,
+        {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                email,
+                password,
+            }),
+        }
+    )
+
+    const data = await res.json()
+
+    if (!res.ok) {
+        const detail =
+            data?.detail ||
+            `Login failed (${res.status})`
+
+        if (Array.isArray(detail)) {
+            throw new Error(
+                detail
+                    .map((item) => item.msg)
+                    .join(', ')
+            )
+        }
+
+        throw new Error(detail)
+    }
+
+    // Backend returns access_token.
+    const token =
+        data?.access_token ||
+        data?.token
+
+    if (!token) {
+        throw new Error(
+            'Login succeeded but no access token was returned by the server.'
+        )
+    }
+
+    setToken(token)
+
+    return data
+}
+
+
+// ============================================================
+// LOGOUT
+// ============================================================
+
+export function logoutUser() {
+    clearToken()
+
+    window.dispatchEvent(
+        new CustomEvent('docmind-logout')
+    )
+}
+
+
+// ============================================================
+// UPLOAD DOCUMENT
+// ============================================================
+
+export async function uploadDocument(file) {
+    const token = getToken()
+
+    if (!token) {
+        throw new Error('Please log in before uploading a document.')
+    }
+
+    const formData = new FormData()
+
+    formData.append('file', file)
+
+    const res = await authenticatedFetch(
+        `${API_BASE}/api/v1/upload`,
+        {
+            method: 'POST',
+            body: formData,
+        }
+    )
+
+    const data = await res.json()
+
+    if (!res.ok) {
+        const detail =
+            data?.detail ||
+            `Upload failed (${res.status})`
+
+        throw new Error(detail)
+    }
+
+    return data
+}
+
+
+// ============================================================
+// SEARCH DOCUMENTS
+// ============================================================
+
+export async function searchDocuments(
+    question,
+    documentId = null
+) {
+    const token = getToken()
+
+    if (!token) {
+        throw new Error('Please log in before searching documents.')
+    }
+
+    const body = {
+        question,
+    }
+
+    if (documentId !== null) {
+        body.document_id = documentId
+    }
+
+    const res = await authenticatedFetch(
+        `${API_BASE}/api/v1/search`,
+        {
+            method: 'POST',
+
+            headers: {
+                'Content-Type': 'application/json',
+            },
+
+            body: JSON.stringify(body),
+        }
+    )
 
     const data = await res.json()
 
     if (!res.ok) {
         if (res.status === 404) {
-            throw new Error('No document is available yet. Upload a PDF first.')
+            const detail =
+                data?.detail ||
+                'No document is available yet. Upload a PDF first.'
+
+            throw new Error(detail)
         }
+
         if (res.status === 422) {
-            throw new Error('Please enter a valid question (at least 3 characters).')
+            throw new Error(
+                'Please enter a valid question (at least 3 characters).'
+            )
         }
-        const detail = data?.detail || `Search failed (${res.status})`
+
+        const detail =
+            data?.detail ||
+            `Search failed (${res.status})`
+
         throw new Error(detail)
     }
 

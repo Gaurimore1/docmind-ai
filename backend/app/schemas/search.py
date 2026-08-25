@@ -6,12 +6,24 @@ from pydantic import BaseModel, Field, field_validator
 class SearchRequest(BaseModel):
     """
     Request body for semantic document search.
+
+    document_id is optional. When provided, the search is scoped to that
+    specific document only. When omitted, all uploaded documents are searched.
     """
 
     question: str = Field(
         ...,
         min_length=3,
         description="Natural language question about the document",
+    )
+
+    document_id: int | None = Field(
+        default=None,
+        description=(
+            "Selected document ID. "
+            "If provided, search is restricted to that document only. "
+            "If omitted, all uploaded documents are searched."
+        ),
     )
 
     @field_validator("question")

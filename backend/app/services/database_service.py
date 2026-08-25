@@ -1,12 +1,17 @@
 # app/services/database_service.py
-#
-# Database persistence layer for DocMind AI.
-#
-# Responsibilities:
-#   1. Save a document and its chunks atomically.
-#   2. Preserve the PDF page number for every chunk.
-#   3. Retrieve the latest document's chunks.
-#   4. Perform vector similarity search using PostgreSQL + pgvector.
+
+"""
+Database persistence and retrieval services for DocMind AI.
+
+Responsibilities:
+    1. Save documents and their chunks atomically.
+    2. Associate every document with its owner.
+    3. Preserve page numbers for every chunk.
+    4. Retrieve the latest document's chunks.
+    5. Perform pgvector similarity search.
+    6. Restrict searches to the authenticated user's documents.
+    7. Prevent duplicate chunks from flooding search results.
+"""
 
 from sqlalchemy.orm import Session
 
@@ -14,28 +19,57 @@ from app.models.document import Document
 from app.models.chunk import Chunk
 
 
+# =============================================================================
+# DOCUMENT + CHUNK PERSISTENCE
+# =============================================================================
+
 def save_document_with_chunks(
     db: Session,
     filename: str,
     chunks: list[dict],
     embeddings: list[list[float]],
+    user_id: int,
 ) -> Document:
     """
-    Save one document and all its chunks in a single transaction.
+    Save one document and all of its chunks in a single transaction.
 
-    Each chunk dictionary must contain:
+    Args:
+        db:
+            Active SQLAlchemy database session.
 
-        {
-            "text": "...",
-            "page_number": 1
-        }
+        filename:
+            Original uploaded PDF filename.
 
-    The embeddings list must contain one embedding for every chunk.
+        chunks:
+            Page-aware chunk dictionaries.
+
+            Each chunk must contain:
+
+                {
+                    "text": "...",
+                    "page_number": 1
+                }
+
+        embeddings:
+            One embedding vector for every chunk.
+
+        user_id:
+            ID of the authenticated user who uploaded the document.
+
+    Returns:
+        The newly created Document ORM object.
+
+    Raises:
+        ValueError:
+            If the number of chunks and embeddings do not match.
+
+        Exception:
+            Any database exception is rolled back and re-raised.
     """
 
-    # ---------------------------------------------------------
-    # Validation
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Validate chunk / embedding alignment
+    # -------------------------------------------------------------------------
 
     if len(chunks) != len(embeddings):
         raise ValueError(
@@ -44,25 +78,31 @@ def save_document_with_chunks(
             "Both lists must have the same length."
         )
 
+    # -------------------------------------------------------------------------
+    # Create everything inside one transaction
+    # -------------------------------------------------------------------------
+
     try:
 
-        # -----------------------------------------------------
-        # Step 1 — Create Document
-        # -----------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Step 1 — Create document
+        # ---------------------------------------------------------------------
 
         document = Document(
-            filename=filename
+            filename=filename,
+            user_id=user_id,
         )
 
         db.add(document)
 
         # Flush so PostgreSQL generates document.id.
-        # The transaction remains open.
+        #
+        # The transaction is still open at this point.
         db.flush()
 
-        # -----------------------------------------------------
-        # Step 2 — Create Chunk rows
-        # -----------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Step 2 — Create chunk rows
+        # ---------------------------------------------------------------------
 
         chunk_objects = []
 
@@ -82,14 +122,13 @@ def save_document_with_chunks(
 
         db.add_all(chunk_objects)
 
-        # -----------------------------------------------------
-        # Step 3 — Commit everything atomically
-        # -----------------------------------------------------
+        # ---------------------------------------------------------------------
+        # Step 3 — Commit atomically
+        # ---------------------------------------------------------------------
 
         db.commit()
 
-        # Refresh the document so database-generated values
-        # are available in Python.
+        # Refresh so database-generated values are available.
         db.refresh(document)
 
         return document
@@ -102,19 +141,22 @@ def save_document_with_chunks(
         raise
 
 
+# =============================================================================
+# LATEST DOCUMENT CHUNKS
+# =============================================================================
+
 def get_latest_document_chunks(
     db: Session,
 ) -> tuple[list[str], list[list[float]]]:
     """
     Retrieve chunks and embeddings belonging to the latest document.
 
-    This function is retained for compatibility with the current
-    search pipeline.
+    This function is retained for compatibility with the existing project.
     """
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Step 1 — Find latest document
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     document = (
         db.query(Document)
@@ -125,9 +167,9 @@ def get_latest_document_chunks(
     if document is None:
         return [], []
 
-    # ---------------------------------------------------------
-    # Step 2 — Load chunks
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Step 2 — Load chunks in their original order
+    # -------------------------------------------------------------------------
 
     chunk_rows = (
         db.query(Chunk)
@@ -140,9 +182,9 @@ def get_latest_document_chunks(
         .all()
     )
 
-    # ---------------------------------------------------------
-    # Step 3 — Extract text and embeddings
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Step 3 — Extract parallel lists
+    # -------------------------------------------------------------------------
 
     chunk_texts = [
         row.chunk_text
@@ -157,104 +199,209 @@ def get_latest_document_chunks(
     return chunk_texts, chunk_embeddings
 
 
+# =============================================================================
+# VECTOR SEARCH
+# =============================================================================
+
 def search_chunks_by_embedding(
     db: Session,
     query_embedding: list[float],
     top_k: int = 5,
+    document_id: int | None = None,
+    user_id: int | None = None,
 ) -> list[dict]:
     """
-    Search across ALL uploaded documents using pgvector cosine distance.
+    Search document chunks using pgvector cosine distance.
 
-    Returns up to top_k genuinely unique results. Deduplication happens
-    at two levels:
+    Security:
+        When user_id is provided, ONLY documents owned by that user
+        are searched.
 
-    1. Database level  — we fetch top_k * 5 candidates so that after
-       deduplication we still have enough unique results to fill top_k.
+    Scope:
+        - user_id=None:
+            All documents are searched.
+        - user_id provided:
+            Only that user's documents are searched.
+        - document_id provided:
+            Search is additionally restricted to that document.
 
-    2. Python level (primary) — deduplicate by chunk_text so that the
-       same document uploaded multiple times never floods the results
-       with semantically identical content.
+    Returns:
+        Up to top_k unique search results.
 
-    3. Python level (secondary) — deduplicate by (document_id, chunk_index)
-       as a safety net against any unexpected query-level duplicates.
+    Each result contains:
 
-    Only chunks that have BOTH a non-null embedding AND a non-null
-    page_number are searched, preserving backwards compatibility with
-    older uploads that lack page numbers.
+        {
+            "chunk_text": str,
+            "similarity_score": float,
+            "chunk_index": int,
+            "page_number": int,
+            "document_id": int,
+            "filename": str
+        }
     """
 
-    # cosine_distance(query_embedding) generates:
-    #   chunks.embedding <=> '[0.1, 0.2, ...]'
-    # Lower value = more similar (distance 0 = identical).
-    distance = Chunk.embedding.cosine_distance(query_embedding)
+    # -------------------------------------------------------------------------
+    # Validate inputs
+    # -------------------------------------------------------------------------
 
-    # Fetch a larger candidate pool (top_k * 5) so that after
-    # deduplication by chunk_text we can still return top_k unique results.
-    # We do NOT use DISTINCT here because SQLAlchemy DISTINCT with an
-    # ORDER BY on a computed expression requires careful handling; it is
-    # safer and clearer to deduplicate in Python after fetching.
-    #
-    # The join is a simple INNER JOIN on the PK — each Chunk row has
-    # exactly one Document row, so no fanout / no duplicate rows from the join.
-    #
-    # Filters:
-    #   Chunk.embedding.isnot(None)   — skip chunks without embeddings
-    #   Chunk.page_number.isnot(None) — skip old chunks without page numbers
-    candidate_limit = top_k * 5
+    if not query_embedding:
+        return []
 
-    raw_rows = (
+    if top_k <= 0:
+        return []
+
+    # -------------------------------------------------------------------------
+    # Calculate cosine distance
+    #
+    # pgvector:
+    #
+    #     0.0 = identical
+    #     higher = less similar
+    #
+    # We later convert this to:
+    #
+    #     similarity = 1.0 - distance
+    # -------------------------------------------------------------------------
+
+    distance = Chunk.embedding.cosine_distance(
+        query_embedding
+    )
+
+    # -------------------------------------------------------------------------
+    # Fetch a larger candidate pool.
+    #
+    # We need extra candidates because some results may be duplicates.
+    # -------------------------------------------------------------------------
+
+    candidate_limit = max(top_k * 5, top_k)
+
+    # -------------------------------------------------------------------------
+    # Base query
+    # -------------------------------------------------------------------------
+
+    query = (
         db.query(
             Chunk,
             Document.filename,
             distance.label("distance"),
         )
-        .join(Document, Chunk.document_id == Document.id)
+        .join(
+            Document,
+            Chunk.document_id == Document.id,
+        )
         .filter(
             Chunk.embedding.isnot(None),
             Chunk.page_number.isnot(None),
         )
-        .order_by(distance)
-        .limit(candidate_limit)
-        .all()
     )
 
-    # -----------------------------------------------------------------
-    # Deduplication — level 1: by chunk_text (semantic deduplication)
-    # -----------------------------------------------------------------
-    # When the same PDF is uploaded multiple times, every upload produces
-    # chunks with identical text. After sorting by distance (best first),
-    # we keep only the first occurrence of each unique chunk_text.
-    # This ensures the top_k results contain genuinely different content.
-    seen_texts: set[str] = set()
+    # -------------------------------------------------------------------------
+    # SECURITY FILTER
+    #
+    # This is the important multi-user boundary.
+    #
+    # Even if a user guesses another document's ID, this condition prevents
+    # chunks belonging to another user from being returned.
+    # -------------------------------------------------------------------------
 
-    # -----------------------------------------------------------------
-    # Deduplication — level 2: by (document_id, chunk_index)
-    # -----------------------------------------------------------------
-    # Safety net against any unexpected duplicate rows from the query.
-    seen_keys: set[tuple[int, int]] = set()
+    if user_id is not None:
+        query = query.filter(
+            Document.user_id == user_id
+        )
+
+    # -------------------------------------------------------------------------
+    # Optional document-specific filtering
+    # -------------------------------------------------------------------------
+
+    if document_id is not None:
+        query = query.filter(
+            Chunk.document_id == document_id
+        )
+
+    # -------------------------------------------------------------------------
+    # Rank by cosine distance.
+    #
+    # Lower distance = more similar.
+    #
+    # Chunk.id provides a deterministic secondary ordering when two chunks
+    # have exactly the same distance.
+    # -------------------------------------------------------------------------
+
+    query = (
+        query
+        .order_by(
+            distance.asc(),
+            Chunk.id.asc(),
+        )
+        .limit(candidate_limit)
+    )
+
+    rows = query.all()
+
+    # -------------------------------------------------------------------------
+    # Python-level deduplication
+    #
+    # Primary key:
+    #     chunk_text
+    #
+    # This prevents repeated uploads of the same PDF from flooding the
+    # response with logically identical chunks.
+    #
+    # Secondary key:
+    #     (document_id, chunk_index)
+    #
+    # This protects against unexpected duplicate database rows.
+    # -------------------------------------------------------------------------
+
+    seen_texts: set[str] = set()
+    seen_chunk_keys: set[tuple[int, int]] = set()
 
     unique_results: list[dict] = []
 
-    for chunk, filename, distance_value in raw_rows:
+    for chunk, filename, distance_value in rows:
 
-        # Skip if this exact text has already been included.
-        if chunk.chunk_text in seen_texts:
+        # ---------------------------------------------------------------------
+        # Skip duplicate text
+        # ---------------------------------------------------------------------
+
+        normalized_text = chunk.chunk_text.strip()
+
+        if normalized_text in seen_texts:
             continue
 
-        # Skip if this (doc_id, chunk_index) pair has already been included.
-        key = (chunk.document_id, chunk.chunk_index)
-        if key in seen_keys:
+        # ---------------------------------------------------------------------
+        # Skip duplicate physical chunk keys
+        # ---------------------------------------------------------------------
+
+        chunk_key = (
+            chunk.document_id,
+            chunk.chunk_index,
+        )
+
+        if chunk_key in seen_chunk_keys:
             continue
 
-        seen_texts.add(chunk.chunk_text)
-        seen_keys.add(key)
+        seen_texts.add(normalized_text)
+        seen_chunk_keys.add(chunk_key)
 
-        # cosine_distance returns a value in [0, 2].
-        # similarity = 1 - distance maps it to [-1, 1].
-        # For well-formed embeddings the result is in [0, 1].
-        similarity = round(1.0 - float(distance_value), 4)
-        # Clamp to [0, 1] to satisfy the Pydantic ge=0/le=1 constraint.
-        similarity = max(0.0, min(1.0, similarity))
+        # ---------------------------------------------------------------------
+        # Convert cosine distance to similarity
+        # ---------------------------------------------------------------------
+
+        similarity = round(
+            1.0 - float(distance_value),
+            4,
+        )
+
+        # Pydantic SearchResult expects [0, 1].
+        similarity = max(
+            0.0,
+            min(1.0, similarity),
+        )
+
+        # ---------------------------------------------------------------------
+        # Build result
+        # ---------------------------------------------------------------------
 
         unique_results.append(
             {
@@ -267,6 +414,7 @@ def search_chunks_by_embedding(
             }
         )
 
+        # Stop once enough unique results have been collected.
         if len(unique_results) >= top_k:
             break
 

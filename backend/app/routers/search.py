@@ -17,6 +17,13 @@ from app.schemas.search import (
 
 from app.database.database import get_db
 
+from app.models.document import Document
+from app.models.user import User
+
+from app.services.auth_dependency import (
+    get_current_user,
+)
+
 from app.services.database_service import (
     search_chunks_by_embedding,
 )
@@ -40,36 +47,86 @@ router = APIRouter(tags=["Search"])
 async def search(
     request: SearchRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Complete RAG search pipeline across ALL uploaded documents.
+    Complete authenticated RAG search pipeline.
 
     Flow:
 
-        User question
-              ↓
+        JWT
+         ↓
+        Current user
+         ↓
+        Optional document validation
+         ↓
         Question embedding
-              ↓
-        PostgreSQL + pgvector
-              ↓
-        Top relevant chunks from ALL documents
-              ↓
+         ↓
+        User-owned documents only
+         ↓
+        pgvector similarity search
+         ↓
+        Top relevant chunks
+         ↓
         Build context
-              ↓
+         ↓
         Ollama / Phi-3
-              ↓
+         ↓
         Answer + sources
     """
 
-    # ---------------------------------------------------------
-    # STEP 1 — Generate question embedding
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 1 — Validate selected document
+    # -------------------------------------------------------------------------
+    #
+    # If document_id is provided, verify BOTH:
+    #
+    #     1. The document exists.
+    #     2. The document belongs to the authenticated user.
+    #
+    # This prevents ID guessing / cross-user document access.
+    # -------------------------------------------------------------------------
 
-    question_embedding = generate_question_embedding(
-        request.question
-    )
+    if request.document_id is not None:
+
+        document_exists = (
+            db.query(Document.id)
+            .filter(
+                Document.id == request.document_id,
+                Document.user_id == current_user.id,
+            )
+            .first()
+        )
+
+        if document_exists is None:
+
+            raise HTTPException(
+                status_code=404,
+                detail="Selected document was not found.",
+            )
+
+    # -------------------------------------------------------------------------
+    # STEP 2 — Generate question embedding
+    # -------------------------------------------------------------------------
+
+    try:
+
+        question_embedding = generate_question_embedding(
+            request.question
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate question embedding: "
+                f"{e}"
+            ),
+        )
 
     if not question_embedding:
+
         raise HTTPException(
             status_code=422,
             detail=(
@@ -78,34 +135,39 @@ async def search(
             ),
         )
 
-    # ---------------------------------------------------------
-    # STEP 2 — Search PostgreSQL + pgvector
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 3 — Search PostgreSQL + pgvector
     #
-    # IMPORTANT:
-    # We no longer select only the latest document.
+    # user_id is ALWAYS passed.
     #
-    # search_chunks_by_embedding() now searches across
-    # ALL uploaded documents.
+    # This means global search means:
+    #
+    #     all documents belonging to THIS USER
+    #
+    # and never all documents in the entire database.
+    # -------------------------------------------------------------------------
 
     raw_results = search_chunks_by_embedding(
         db=db,
         query_embedding=question_embedding,
         top_k=5,
+        document_id=request.document_id,
+        user_id=current_user.id,
     )
 
     if not raw_results:
+
         raise HTTPException(
             status_code=404,
             detail=(
                 "No relevant information found "
-                "in the uploaded documents."
+                "in your uploaded documents."
             ),
         )
 
-    # ---------------------------------------------------------
-    # STEP 3 — Build context for Ollama
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 4 — Build context for Ollama
+    # -------------------------------------------------------------------------
 
     context_parts = []
 
@@ -115,6 +177,7 @@ async def search(
             (
                 f"Document: {result['filename']}\n"
                 f"Page: {result['page_number']}\n"
+                f"Chunk: {result['chunk_index']}\n"
                 f"Content:\n"
                 f"{result['chunk_text']}"
             )
@@ -126,9 +189,9 @@ async def search(
         "\n\n"
     ).join(context_parts)
 
-    # ---------------------------------------------------------
-    # STEP 4 — Generate answer using Ollama
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 5 — Generate answer using Ollama
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -148,18 +211,21 @@ async def search(
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to generate answer: {e}",
+            detail=(
+                "Failed to generate answer: "
+                f"{e}"
+            ),
         )
 
-    # ---------------------------------------------------------
-    # STEP 5 — Build search results
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 6 — Build SearchResult objects
+    # -------------------------------------------------------------------------
 
-    search_results = []
+    results = []
 
     for result in raw_results:
 
-        search_results.append(
+        results.append(
             SearchResult(
                 chunk_text=result["chunk_text"],
                 similarity_score=result["similarity_score"],
@@ -168,9 +234,9 @@ async def search(
             )
         )
 
-    # ---------------------------------------------------------
-    # STEP 6 — Build source citations
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 7 — Build source citations
+    # -------------------------------------------------------------------------
 
     sources = []
 
@@ -185,12 +251,12 @@ async def search(
             )
         )
 
-    # ---------------------------------------------------------
-    # STEP 7 — Return complete RAG response
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # STEP 8 — Return final response
+    # -------------------------------------------------------------------------
 
     return SearchResponse(
         answer=answer,
         sources=sources,
-        results=search_results,
+        results=results,
     )

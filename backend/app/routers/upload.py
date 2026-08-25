@@ -12,6 +12,12 @@ from sqlalchemy.orm import Session
 
 from app.database.database import get_db
 
+from app.models.user import User
+
+from app.services.auth_dependency import (
+    get_current_user,
+)
+
 from app.services.file_service import (
     save_upload_file,
 )
@@ -40,26 +46,33 @@ router = APIRouter(tags=["Upload"])
 async def upload_pdf(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Upload a PDF and process it through the complete pipeline:
+    Upload a PDF and process it through the complete pipeline.
 
-    PDF
-      ↓
-    Save file
-      ↓
-    Extract text
-      ↓
-    Split into page-aware chunks
-      ↓
-    Generate embeddings
-      ↓
-    Store document + chunks + embeddings in PostgreSQL
+    Pipeline:
+
+        Authenticated user
+              ↓
+        PDF upload
+              ↓
+        Save file
+              ↓
+        Extract text
+              ↓
+        Page-aware chunking
+              ↓
+        Generate embeddings
+              ↓
+        Save document with user_id
+              ↓
+        Save chunks + embeddings
     """
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 1. Validate file type
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     if file.content_type != "application/pdf":
         raise HTTPException(
@@ -70,13 +83,15 @@ async def upload_pdf(
             ),
         )
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 2. Save uploaded PDF
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     try:
 
-        saved_path, file_size = await save_upload_file(file)
+        saved_path, file_size = await save_upload_file(
+            file
+        )
 
     except Exception as e:
 
@@ -85,9 +100,9 @@ async def upload_pdf(
             detail=f"Failed to save uploaded file: {e}",
         )
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 3. Extract PDF text
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -102,9 +117,9 @@ async def upload_pdf(
             detail=str(e),
         )
 
-    # ---------------------------------------------------------
-    # 4. Create preview
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 4. Create text preview
+    # -------------------------------------------------------------------------
 
     text_preview = (
         extraction["text"]
@@ -112,9 +127,9 @@ async def upload_pdf(
         [:500]
     )
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 5. Create page-aware chunks
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -128,21 +143,21 @@ async def upload_pdf(
             status_code=500,
             detail=str(e),
         )
-    
+
     chunk_count = len(chunks)
 
-    # ---------------------------------------------------------
-    # 6. Extract only chunk text for embedding
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 6. Extract chunk text for embedding
+    # -------------------------------------------------------------------------
 
     chunk_texts = [
         chunk["text"]
         for chunk in chunks
     ]
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 7. Generate embeddings
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -157,11 +172,13 @@ async def upload_pdf(
             detail=f"Failed to generate embeddings: {e}",
         )
 
-    embeddings_generated = len(embeddings)
+    embeddings_generated = len(
+        embeddings
+    )
 
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
     # 8. Determine embedding dimension
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
 
     embedding_dimension = (
         len(embeddings[0])
@@ -169,9 +186,30 @@ async def upload_pdf(
         else 0
     )
 
-    # ---------------------------------------------------------
-    # 9. Save everything to PostgreSQL
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 9. Validate chunk / embedding count
+    # -------------------------------------------------------------------------
+
+    if chunk_count != embeddings_generated:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Chunk/embedding mismatch: "
+                f"{chunk_count} chunks but "
+                f"{embeddings_generated} embeddings generated."
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # 10. Save document + chunks + embeddings
+    #
+    # IMPORTANT:
+    #
+    # current_user.id is the authenticated owner's ID.
+    #
+    # This is what connects the uploaded document to the user.
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -180,6 +218,7 @@ async def upload_pdf(
             filename=file.filename,
             chunks=chunks,
             embeddings=embeddings,
+            user_id=current_user.id,
         )
 
     except ValueError as e:
@@ -193,17 +232,21 @@ async def upload_pdf(
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save document to database: {e}",
+            detail=(
+                "Failed to save document to database: "
+                f"{e}"
+            ),
         )
 
-    # ---------------------------------------------------------
-    # 10. Return response
-    # ---------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # 11. Return response
+    # -------------------------------------------------------------------------
 
     return {
         "status": "success",
         "filename": file.filename,
         "document_id": document.id,
+        "user_id": current_user.id,
         "file_size": file_size,
         "pages": extraction["pages"],
         "chunks": chunk_count,
