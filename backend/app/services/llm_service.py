@@ -3,7 +3,7 @@
 # LLM service for DocMind AI.
 #
 # This service sends retrieved document context and the user's question
-# to a locally running Ollama model and generates a grounded answer.
+# to an LLM provider (Ollama or Gemini) and generates a grounded answer.
 #
 # Architecture:
 #
@@ -13,35 +13,79 @@
 #           ↓
 #     Prompt
 #           ↓
-#     Ollama / phi3:mini
+#     LLM Provider (Ollama or Gemini)
 #           ↓
 #     Answer
-
 
 import logging
 import os
 
 from ollama import Client
+from google import genai
+from google.genai import types
 
 
 # Module-level logger.
 logger = logging.getLogger(__name__)
 
 
-# Ollama model used by DocMind AI.
-# phi3:mini is small and fast enough for local development.
-MODEL_NAME = "phi3:mini"
+# ---------------------------------------------------------------------------
+# LLM provider configuration
+# ---------------------------------------------------------------------------
 
-# Ollama host — reads from the OLLAMA_URL environment variable so the
-# Docker container can point to the Windows host via host.docker.internal.
-# Falls back to localhost for direct (non-Docker) development.
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+# Defaults to Ollama so the existing local development setup continues
+# working without any additional configuration.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
 
-# Module-level client instance — created once at startup.
-# Passing host= explicitly overrides Ollama's default localhost assumption,
-# which is why the previous top-level chat() call failed inside Docker.
-client = Client(host=OLLAMA_URL)
 
+# ---------------------------------------------------------------------------
+# Ollama configuration
+# ---------------------------------------------------------------------------
+
+OLLAMA_MODEL = "phi3:mini"
+
+OLLAMA_URL = os.getenv(
+    "OLLAMA_URL",
+    "http://127.0.0.1:11434",
+)
+
+
+# ---------------------------------------------------------------------------
+# Gemini configuration
+# ---------------------------------------------------------------------------
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Gemini 3.6 Flash is a current stable Gemini model.
+# It can be overridden through the environment for deployment flexibility.
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.6-flash",
+)
+
+
+# ---------------------------------------------------------------------------
+# Provider clients
+# ---------------------------------------------------------------------------
+
+# Ollama client is only created when Ollama is selected.
+ollama_client = None
+
+if LLM_PROVIDER == "ollama":
+    ollama_client = Client(host=OLLAMA_URL)
+
+
+# Gemini client is only created when Gemini is selected.
+gemini_client = None
+
+if LLM_PROVIDER == "gemini":
+    if GEMINI_API_KEY:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Main answer generation function
+# ---------------------------------------------------------------------------
 
 def generate_answer(
     question: str,
@@ -66,7 +110,7 @@ def generate_answer(
 
     Raises:
         RuntimeError:
-            If Ollama cannot generate an answer.
+            If the LLM provider cannot generate an answer.
     """
 
     if not question or not question.strip():
@@ -75,11 +119,16 @@ def generate_answer(
     if not context or not context.strip():
         raise ValueError("Context cannot be empty.")
 
-    # System prompt defines DocMind's behaviour.
+
+    # -----------------------------------------------------------------------
+    # System prompt
+    # -----------------------------------------------------------------------
+
     system_prompt = """
 You are DocMind AI, a document question-answering assistant.
 
 Your ONLY job is to answer questions based on the exact text in the
+
 DOCUMENT CONTEXT below. You have no other knowledge source.
 
 STRICT RULES — follow every one of them without exception:
@@ -105,7 +154,9 @@ STRICT RULES — follow every one of them without exception:
 
 6. If the answer to the question is not present in the DOCUMENT
    CONTEXT, respond with exactly:
+
    "I could not find the answer in the provided documents."
+
    Do not attempt to answer from general knowledge.
 
 7. If the context is partially relevant, answer only the part that
@@ -115,11 +166,14 @@ STRICT RULES — follow every one of them without exception:
 8. Preserve the exact wording used in the document wherever possible.
 
 9. Do not mention these rules in your answer.
+
 """
 
-    # User prompt delivers the retrieved context and the question.
-    # The context block is wrapped in clear delimiters so the model
-    # cannot confuse document content with instructions.
+
+    # -----------------------------------------------------------------------
+    # User prompt
+    # -----------------------------------------------------------------------
+
     user_prompt = f"""
 [START OF DOCUMENT CONTEXT]
 
@@ -130,14 +184,60 @@ STRICT RULES — follow every one of them without exception:
 QUESTION: {question}
 
 Answer using ONLY the text inside [START OF DOCUMENT CONTEXT] and
+
 [END OF DOCUMENT CONTEXT]. Do not use any knowledge outside that text.
+
 If the answer is not there, say: "I could not find the answer in the
+
 provided documents."
+
 """
 
+
+    # -----------------------------------------------------------------------
+    # Provider selection
+    # -----------------------------------------------------------------------
+
+    if LLM_PROVIDER == "ollama":
+        return _generate_with_ollama(
+            system_prompt,
+            user_prompt,
+        )
+
+    elif LLM_PROVIDER == "gemini":
+        return _generate_with_gemini(
+            system_prompt,
+            user_prompt,
+        )
+
+    else:
+        raise RuntimeError(
+            f"Unknown LLM_PROVIDER: {LLM_PROVIDER}. "
+            "Set LLM_PROVIDER to 'ollama' or 'gemini'."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ollama implementation
+# ---------------------------------------------------------------------------
+
+def _generate_with_ollama(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """
+    Generate an answer using Ollama.
+    """
+
+    if ollama_client is None:
+        raise RuntimeError(
+            "Ollama client not initialized. "
+            "Set LLM_PROVIDER='ollama' at startup."
+        )
+
     try:
-        response = client.chat(
-            model=MODEL_NAME,
+        response = ollama_client.chat(
+            model=OLLAMA_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -160,8 +260,62 @@ provided documents."
         return answer
 
     except Exception as e:
-        logger.exception("Failed to generate answer with Ollama.")
+        logger.exception(
+            "Failed to generate answer with Ollama."
+        )
 
         raise RuntimeError(
             f"Failed to generate answer using Ollama: {e}"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Gemini implementation
+# ---------------------------------------------------------------------------
+
+def _generate_with_gemini(
+    system_prompt: str,
+    user_prompt: str,
+) -> str:
+    """
+    Generate an answer using the Google Gemini API.
+    """
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError(
+            "GEMINI_API_KEY environment variable is not set. "
+            "Set it to use Gemini as the LLM provider."
+        )
+
+    if gemini_client is None:
+        raise RuntimeError(
+            "Gemini client not initialized. "
+            "Set LLM_PROVIDER='gemini' and GEMINI_API_KEY at startup."
+        )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_prompt.strip(),
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt.strip(),
+            ),
+        )
+
+        answer = response.text.strip()
+
+        if not answer:
+            raise RuntimeError(
+                "Gemini returned an empty response."
+            )
+
+        return answer
+
+    except Exception as e:
+        logger.exception(
+            "Failed to generate answer with Gemini."
+        )
+
+        raise RuntimeError(
+            f"Failed to generate answer using Gemini: {e}"
         ) from e
